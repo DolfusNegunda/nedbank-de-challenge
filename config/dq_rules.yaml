@@ -1,0 +1,84 @@
+# ============================================================
+# dq_rules.yaml
+#
+# Data Quality rules for the Silver transformation layer.
+# Required from Stage 2 onward (challenge_rules.md §3.6).
+# Included at Stage 1 to avoid a rewrite at Stage 2.
+#
+# The pipeline reads DQ logic from this file — no handling
+# rules are hardcoded in Python.
+#
+# Valid dq_flag values (output_schema_spec.md §8):
+#   NULL_REQUIRED, TYPE_MISMATCH, DATE_FORMAT,
+#   CURRENCY_VARIANT, ORPHANED_ACCOUNT, DUPLICATE_DEDUPED
+# ============================================================
+
+null_checks:
+  transactions:
+    - transaction_id
+    - account_id
+    - transaction_date
+    - amount
+    - transaction_type
+    - currency
+    - channel
+  accounts:
+    - account_id      # null account_id rows are quarantined (dropped)
+  customers:
+    - customer_id
+
+type_checks:
+  transactions:
+    amount:                decimal
+    transaction_date:      date
+    transaction_timestamp: timestamp
+
+domain_checks:
+  transaction_type:
+    allowed: [DEBIT, CREDIT, FEE, REVERSAL]
+    dq_flag: TYPE_MISMATCH
+  channel:
+    allowed: [POS, APP, ATM, EFT, USSD, INTERNAL]
+    dq_flag: TYPE_MISMATCH
+
+currency_normalisation:
+  target_value: ZAR
+  flag_variants: true
+  known_variants:
+    - ZAR
+    - zar
+    - R
+    - rands
+    - "710"
+
+date_format_checks:
+  formats:
+    - yyyy-MM-dd
+    - dd/MM/yyyy
+    - epoch
+  affected_fields:
+    - transaction_date
+    - open_date
+    - last_activity_date
+    - dob
+
+referential_integrity:
+  transactions:
+    - field:      account_id
+      references: silver_accounts.account_id
+      dq_flag:    ORPHANED_ACCOUNT
+      action:     flag_and_exclude_from_gold
+
+deduplication:
+  transactions:
+    natural_key:  transaction_id
+    order_by:     transaction_time
+    action:       drop_duplicate
+  accounts:
+    natural_key:  account_id
+    order_by:     ingestion_timestamp
+    action:       drop_duplicate
+  customers:
+    natural_key:  customer_id
+    order_by:     ingestion_timestamp
+    action:       drop_duplicate
