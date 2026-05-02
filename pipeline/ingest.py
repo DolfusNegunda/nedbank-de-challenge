@@ -20,10 +20,10 @@ Design decisions
 1. As-arrived preservation — no type coercion, no filtering.
 2. JSONL flattening — nested location/metadata structs are flattened to
    top-level columns so Silver can apply typed casts without re-parsing JSON.
-3. Explicit JSONL schema — avoids a full-file scan for inference on 1 M records.
-   merchant_subcategory is declared nullable; absent in Stage 1 (null-filled).
+3. Explicit JSONL schema — avoids a full-file scan for inference on 1 M / 3.15 M records.
 4. mode=overwrite + overwriteSchema=True — idempotent re-runs.
 5. Single ingestion_timestamp literal per run (not per-row) for watermarking.
+6. Returns raw source counts for Stage 2 dq_report.json generation.
 """
 
 from __future__ import annotations
@@ -44,31 +44,45 @@ from pyspark.sql.types import (
 
 logger = logging.getLogger(__name__)
 
-_TRANSACTION_SCHEMA = StructType([
-    StructField("transaction_id",       StringType(),  nullable=False),
-    StructField("account_id",           StringType(),  nullable=False),
-    StructField("transaction_date",     StringType(),  nullable=False),
-    StructField("transaction_time",     StringType(),  nullable=False),
-    StructField("transaction_type",     StringType(),  nullable=False),
-    StructField("merchant_category",    StringType(),  nullable=True),
-    StructField("merchant_subcategory", StringType(),  nullable=True),
-    StructField("amount",               DoubleType(),  nullable=False),
-    StructField("currency",             StringType(),  nullable=False),
-    StructField("channel",              StringType(),  nullable=False),
-    StructField("location", StructType([
-        StructField("province",    StringType(), nullable=True),
-        StructField("city",        StringType(), nullable=True),
-        StructField("coordinates", StringType(), nullable=True),
-    ]), nullable=True),
-    StructField("metadata", StructType([
-        StructField("device_id",   StringType(),  nullable=True),
-        StructField("session_id",  StringType(),  nullable=True),
-        StructField("retry_flag",  BooleanType(), nullable=False),
-    ]), nullable=True),
-])
+_TRANSACTION_SCHEMA = StructType(
+    [
+        StructField("transaction_id", StringType(), nullable=False),
+        StructField("account_id", StringType(), nullable=False),
+        StructField("transaction_date", StringType(), nullable=False),
+        StructField("transaction_time", StringType(), nullable=False),
+        StructField("transaction_type", StringType(), nullable=False),
+        StructField("merchant_category", StringType(), nullable=True),
+        StructField("merchant_subcategory", StringType(), nullable=True),
+        StructField("amount", DoubleType(), nullable=False),
+        StructField("currency", StringType(), nullable=False),
+        StructField("channel", StringType(), nullable=False),
+        StructField(
+            "location",
+            StructType(
+                [
+                    StructField("province", StringType(), nullable=True),
+                    StructField("city", StringType(), nullable=True),
+                    StructField("coordinates", StringType(), nullable=True),
+                ]
+            ),
+            nullable=True,
+        ),
+        StructField(
+            "metadata",
+            StructType(
+                [
+                    StructField("device_id", StringType(), nullable=True),
+                    StructField("session_id", StringType(), nullable=True),
+                    StructField("retry_flag", BooleanType(), nullable=False),
+                ]
+            ),
+            nullable=True,
+        ),
+    ]
+)
 
 
-def run_ingestion(spark: SparkSession, cfg: dict[str, Any]) -> None:
+def run_ingestion(spark: SparkSession, cfg: dict[str, Any]) -> dict[str, int]:
     """Ingest all three source files into the Bronze Delta layer.
 
     Parameters
@@ -77,43 +91,64 @@ def run_ingestion(spark: SparkSession, cfg: dict[str, Any]) -> None:
         Active SparkSession with Delta Lake extensions configured.
     cfg:
         Parsed pipeline_config.yaml as a plain dict.
+
+    Returns
+    -------
+    dict[str, int]
+        Raw source record counts keyed as:
+        - accounts_raw
+        - customers_raw
+        - transactions_raw
     """
     ingestion_ts = datetime.now(tz=timezone.utc)
     logger.info("Bronze ingestion started at %s", ingestion_ts.isoformat())
 
-    input_cfg:  dict[str, str] = cfg["input"]
-    bronze_root: str           = cfg["output"]["bronze_path"]
+    input_cfg: dict[str, str] = cfg["input"]
+    bronze_root: str = cfg["output"]["bronze_path"]
 
-    _ingest_accounts(
+    accounts_df = _read_accounts(
         spark=spark,
         src_path=input_cfg["accounts_path"],
-        dst_path=f"{bronze_root}/accounts",
         ingestion_ts=ingestion_ts,
     )
-    _ingest_customers(
+    customers_df = _read_customers(
         spark=spark,
         src_path=input_cfg["customers_path"],
-        dst_path=f"{bronze_root}/customers",
         ingestion_ts=ingestion_ts,
     )
-    _ingest_transactions(
+    transactions_df = _read_transactions(
         spark=spark,
         src_path=input_cfg["transactions_path"],
-        dst_path=f"{bronze_root}/transactions",
         ingestion_ts=ingestion_ts,
     )
 
+    source_counts: dict[str, int] = {
+        "accounts_raw": accounts_df.count(),
+        "customers_raw": customers_df.count(),
+        "transactions_raw": transactions_df.count(),
+    }
+
+    _write_delta(accounts_df, f"{bronze_root}/accounts")
+    logger.info("Accounts ingested: %d rows", source_counts["accounts_raw"])
+
+    _write_delta(customers_df, f"{bronze_root}/customers")
+    logger.info("Customers ingested: %d rows", source_counts["customers_raw"])
+
+    _write_delta(transactions_df, f"{bronze_root}/transactions")
+    logger.info("Transactions ingested: %d rows", source_counts["transactions_raw"])
+
     logger.info("Bronze ingestion complete.")
+    return source_counts
 
 
-def _ingest_accounts(
+def _read_accounts(
     spark: SparkSession,
     src_path: str,
-    dst_path: str,
     ingestion_ts: datetime,
-) -> None:
-    """Read accounts.csv and write to bronze/accounts/ as Delta."""
-    logger.info("Ingesting accounts: %s -> %s", src_path, dst_path)
+) -> DataFrame:
+    """Read accounts.csv into a Bronze dataframe."""
+    logger.info("Ingesting accounts: %s -> Bronze dataframe", src_path)
+
     df: DataFrame = (
         spark.read
         .option("header", "true")
@@ -121,19 +156,18 @@ def _ingest_accounts(
         .option("encoding", "UTF-8")
         .csv(src_path)
     )
-    df = _add_ingestion_timestamp(df, ingestion_ts)
-    _write_delta(df, dst_path)
-    logger.info("Accounts ingested: %d rows", df.count())
+
+    return _add_ingestion_timestamp(df, ingestion_ts)
 
 
-def _ingest_customers(
+def _read_customers(
     spark: SparkSession,
     src_path: str,
-    dst_path: str,
     ingestion_ts: datetime,
-) -> None:
-    """Read customers.csv and write to bronze/customers/ as Delta."""
-    logger.info("Ingesting customers: %s -> %s", src_path, dst_path)
+) -> DataFrame:
+    """Read customers.csv into a Bronze dataframe."""
+    logger.info("Ingesting customers: %s -> Bronze dataframe", src_path)
+
     df: DataFrame = (
         spark.read
         .option("header", "true")
@@ -141,40 +175,39 @@ def _ingest_customers(
         .option("encoding", "UTF-8")
         .csv(src_path)
     )
-    df = _add_ingestion_timestamp(df, ingestion_ts)
-    _write_delta(df, dst_path)
-    logger.info("Customers ingested: %d rows", df.count())
+
+    return _add_ingestion_timestamp(df, ingestion_ts)
 
 
-def _ingest_transactions(
+def _read_transactions(
     spark: SparkSession,
     src_path: str,
-    dst_path: str,
     ingestion_ts: datetime,
-) -> None:
-    """Read transactions.jsonl and write to bronze/transactions/ as Delta.
+) -> DataFrame:
+    """Read transactions.jsonl into a Bronze dataframe.
 
     Nested location and metadata structs are flattened to top-level columns.
     """
-    logger.info("Ingesting transactions: %s -> %s", src_path, dst_path)
+    logger.info("Ingesting transactions: %s -> Bronze dataframe", src_path)
+
     df: DataFrame = (
         spark.read
         .schema(_TRANSACTION_SCHEMA)
         .json(src_path)
     )
+
     df = (
         df
-        .withColumn("location_province",    F.col("location.province"))
-        .withColumn("location_city",        F.col("location.city"))
+        .withColumn("location_province", F.col("location.province"))
+        .withColumn("location_city", F.col("location.city"))
         .withColumn("location_coordinates", F.col("location.coordinates"))
-        .withColumn("metadata_device_id",   F.col("metadata.device_id"))
-        .withColumn("metadata_session_id",  F.col("metadata.session_id"))
-        .withColumn("metadata_retry_flag",  F.col("metadata.retry_flag"))
+        .withColumn("metadata_device_id", F.col("metadata.device_id"))
+        .withColumn("metadata_session_id", F.col("metadata.session_id"))
+        .withColumn("metadata_retry_flag", F.col("metadata.retry_flag"))
         .drop("location", "metadata")
     )
-    df = _add_ingestion_timestamp(df, ingestion_ts)
-    _write_delta(df, dst_path)
-    logger.info("Transactions ingested: %d rows", df.count())
+
+    return _add_ingestion_timestamp(df, ingestion_ts)
 
 
 def _add_ingestion_timestamp(df: DataFrame, ts: datetime) -> DataFrame:

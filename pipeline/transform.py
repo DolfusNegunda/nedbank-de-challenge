@@ -3,138 +3,372 @@ pipeline/transform.py
 ─────────────────────
 Silver layer: clean, type-cast, deduplicate, and DQ-flag Bronze tables.
 
-Contract
---------
-Inputs  (Bronze Delta tables):
-    /data/output/bronze/accounts/
-    /data/output/bronze/transactions/
-    /data/output/bronze/customers/
+Architecture
+------------
+run_silver_small_tables():
+    Spark-based transformation for customers and accounts.
 
-Outputs (Silver Delta tables):
-    /data/output/silver/accounts/
-    /data/output/silver/transactions/
-    /data/output/silver/customers/
+run_silver_transactions_duckdb():
+    DuckDB-based transformation for large Stage 2 transaction volume.
 
-Design decisions
-----------------
-1. Type safety — all date/decimal/boolean casts happen here, not in Gold.
-2. Deduplication — window-function based, keeping the first occurrence
-   ordered by ingestion_timestamp.  Deterministic and idempotent.
-3. DQ flagging — single dq_flag column on silver/transactions.
-   Stage 1 data is clean so all flags will be NULL.
-   Stage 2 DQ handling is already wired — no structural changes needed.
-4. Currency normalisation — all known ZAR variants mapped to "ZAR" before
-   the flag is applied, so Gold always sees "ZAR".
-5. merchant_subcategory — absent in Stage 1 JSON; arrives as null column.
+run_silver_transactions_delta_register():
+    Spark re-registers DuckDB output as Delta.
 """
 
 from __future__ import annotations
 
+import glob
 import logging
+import os
+import uuid
 from typing import Any
 
+import duckdb
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import DecimalType
 
 logger = logging.getLogger(__name__)
 
-# ── DQ issue codes (output_schema_spec.md §8) ─────────────────────────────────
-_DQ_ORPHANED_ACCOUNT  = "ORPHANED_ACCOUNT"
+_DQ_ORPHANED_ACCOUNT = "ORPHANED_ACCOUNT"
 _DQ_DUPLICATE_DEDUPED = "DUPLICATE_DEDUPED"
-_DQ_TYPE_MISMATCH     = "TYPE_MISMATCH"
-_DQ_DATE_FORMAT       = "DATE_FORMAT"
-_DQ_CURRENCY_VARIANT  = "CURRENCY_VARIANT"
-_DQ_NULL_REQUIRED     = "NULL_REQUIRED"
+_DQ_TYPE_MISMATCH = "TYPE_MISMATCH"
+_DQ_DATE_FORMAT = "DATE_FORMAT"
+_DQ_CURRENCY_VARIANT = "CURRENCY_VARIANT"
+_DQ_NULL_REQUIRED = "NULL_REQUIRED"
 
-# ── Currency normalisation map (data_dictionary.md §4) ────────────────────────
 _CURRENCY_VARIANTS: dict[str, str] = {
-    "ZAR":   "ZAR",
-    "zar":   "ZAR",
-    "R":     "ZAR",
+    "ZAR": "ZAR",
+    "zar": "ZAR",
+    "R": "ZAR",
     "rands": "ZAR",
-    "710":   "ZAR",
+    "710": "ZAR",
 }
 
-# ── Date format patterns (Stage 1: ISO only; Stage 2: adds DD/MM/YYYY + epoch)
 _DATE_FORMATS: list[str] = [
     "yyyy-MM-dd",
+    "yyyy-MM-dd HH:mm:ss",
     "dd/MM/yyyy",
+    "dd/MM/yyyy HH:mm:ss",
 ]
 
 
-def run_transformation(spark: SparkSession, cfg: dict[str, Any]) -> None:
-    """Transform Bronze tables into typed, deduplicated Silver tables.
+def run_silver_small_tables(spark: SparkSession, cfg: dict[str, Any]) -> dict[str, int]:
+    """Transform Bronze customers and accounts into Silver Delta tables."""
+    logger.info("Silver transformation started (small tables).")
 
-    Parameters
-    ----------
-    spark:
-        Active SparkSession with Delta Lake extensions configured.
-    cfg:
-        Parsed pipeline_config.yaml as a plain dict.
-    """
-    logger.info("Silver transformation started.")
+    bronze_root = cfg["output"]["bronze_path"]
+    silver_root = cfg["output"]["silver_path"]
 
-    bronze_root: str = cfg["output"]["bronze_path"]
-    silver_root: str = cfg["output"]["silver_path"]
+    bronze_customers = spark.read.format("delta").load(bronze_root + "/customers")
+    bronze_accounts = spark.read.format("delta").load(bronze_root + "/accounts")
 
-    bronze_accounts     = spark.read.format("delta").load(f"{bronze_root}/accounts")
-    bronze_customers    = spark.read.format("delta").load(f"{bronze_root}/customers")
-    bronze_transactions = spark.read.format("delta").load(f"{bronze_root}/transactions")
+    silver_customers = _transform_customers(bronze_customers)
+    silver_accounts, null_pk_count = _transform_accounts(bronze_accounts, silver_customers)
 
-    silver_customers    = _transform_customers(bronze_customers)
-    silver_accounts     = _transform_accounts(bronze_accounts, silver_customers)
-    silver_transactions = _transform_transactions(bronze_transactions, silver_accounts)
+    _write_delta_spark(silver_customers.coalesce(2), silver_root + "/customers")
+    logger.info("Silver customers written.")
 
-    _write_delta(silver_customers,    f"{silver_root}/customers")
-    _write_delta(silver_accounts,     f"{silver_root}/accounts")
-    _write_delta(silver_transactions, f"{silver_root}/transactions")
+    _write_delta_spark(silver_accounts.coalesce(2), silver_root + "/accounts")
+    logger.info("Silver accounts written.")
 
-    logger.info("Silver transformation complete.")
+    return {
+        _DQ_NULL_REQUIRED: null_pk_count,
+    }
+
+
+def run_silver_transactions_duckdb(cfg: dict[str, Any]) -> dict[str, int]:
+    """Process Silver transactions in DuckDB using a two-pass chunked strategy."""
+    bronze_root = cfg["output"]["bronze_path"]
+    silver_root = cfg["output"]["silver_path"]
+
+    bronze_path = bronze_root + "/transactions"
+    silver_accts = silver_root + "/accounts"
+    silver_path = silver_root + "/transactions"
+
+    logger.info("Transforming transactions via DuckDB (two-pass chunked).")
+
+    bronze_files = sorted(_find_parquet_files(bronze_path))
+    acct_parquet = _find_parquet_files(silver_accts)
+
+    if not bronze_files:
+        raise RuntimeError("No Parquet files in Bronze transactions: " + bronze_path)
+    if not acct_parquet:
+        raise RuntimeError("No Parquet files in Silver accounts: " + silver_accts)
+
+    logger.info("Bronze transaction Parquet files: %d", len(bronze_files))
+    os.makedirs(silver_path, exist_ok=True)
+
+    run_id = uuid.uuid4().hex
+    dedup_keys_path = f"/tmp/dedup_keys_{run_id}.parquet"
+
+    acct_glob = silver_accts + "/**/*.parquet"
+    bronze_glob = bronze_path + "/**/*.parquet"
+
+    duplicate_count_total = 0
+    orphan_count_total = 0
+    type_mismatch_count_total = 0
+    date_format_count_total = 0
+    currency_variant_count_total = 0
+
+    logger.info("Pass 1: building dedup keys (transaction_id, min_timestamp).")
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("SET memory_limit='300MB'")
+        con.execute("SET threads=2")
+        con.execute("SET temp_directory='/tmp'")
+
+        con.execute(
+            "CREATE VIEW all_txn AS "
+            "SELECT transaction_id, "
+            "       transaction_date, "
+            "       transaction_time "
+            "FROM read_parquet('" + bronze_glob + "', hive_partitioning=false)"
+        )
+
+        con.execute(
+            "COPY ("
+            "  SELECT transaction_id, "
+            "         MIN("
+            "             COALESCE("
+            "                 TRY_STRPTIME(transaction_date || ' ' || transaction_time, '%Y-%m-%d %H:%M:%S'),"
+            "                 TRY_STRPTIME(transaction_date || ' ' || transaction_time, '%d/%m/%Y %H:%M:%S'),"
+            "                 TRY_STRPTIME(transaction_date || ' 00:00:00', '%Y-%m-%d %H:%M:%S'),"
+            "                 TRY_STRPTIME(transaction_date || ' 00:00:00', '%d/%m/%Y %H:%M:%S')"
+            "             )"
+            "         ) AS min_ts "
+            "  FROM all_txn "
+            "  GROUP BY transaction_id"
+            ") TO '" + dedup_keys_path + "' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED)"
+        )
+
+        duplicate_row = con.execute(
+            "SELECT "
+            "  (SELECT COUNT(*) FROM all_txn) - "
+            "  (SELECT COUNT(*) FROM read_parquet('" + dedup_keys_path + "'))"
+        ).fetchone()
+
+        duplicate_count_total = int(duplicate_row[0] or 0)
+
+        logger.info(
+            "Dedup keys written to: %s (global duplicate rows=%d)",
+            dedup_keys_path,
+            duplicate_count_total,
+        )
+    finally:
+        con.close()
+
+    currency_case_lines = []
+    for variant, canonical in _CURRENCY_VARIANTS.items():
+        currency_case_lines.append(
+            "                WHEN currency = '" + variant + "' THEN '" + canonical + "'"
+        )
+    currency_cases_sql = "\n".join(currency_case_lines)
+
+    logger.info("Pass 2: processing %d Bronze files individually.", len(bronze_files))
+
+    for idx, bronze_file in enumerate(bronze_files):
+        out_file = silver_path + "/chunk_" + str(idx).zfill(4) + ".parquet"
+
+        con = duckdb.connect(database=":memory:")
+        try:
+            con.execute("SET memory_limit='300MB'")
+            con.execute("SET threads=2")
+            con.execute("SET temp_directory='/tmp'")
+
+            con.execute(
+                "CREATE VIEW dedup_keys AS "
+                "SELECT * FROM read_parquet('" + dedup_keys_path + "')"
+            )
+            con.execute(
+                "CREATE VIEW silver_acct AS "
+                "SELECT account_id "
+                "FROM read_parquet('" + acct_glob + "', hive_partitioning=false)"
+            )
+            con.execute(
+                "CREATE VIEW chunk_txn AS "
+                "SELECT * FROM read_parquet('" + bronze_file + "')"
+            )
+
+            sql = (
+                "COPY (\n"
+                "    WITH parsed AS (\n"
+                "        SELECT *,\n"
+                "            COALESCE(\n"
+                "                TRY_STRPTIME(transaction_date || ' ' || transaction_time, '%Y-%m-%d %H:%M:%S'),\n"
+                "                TRY_STRPTIME(transaction_date || ' ' || transaction_time, '%d/%m/%Y %H:%M:%S'),\n"
+                "                TRY_STRPTIME(transaction_date || ' 00:00:00', '%Y-%m-%d %H:%M:%S'),\n"
+                "                TRY_STRPTIME(transaction_date || ' 00:00:00', '%d/%m/%Y %H:%M:%S'),\n"
+                "                TRY_CAST(TO_TIMESTAMP(TRY_CAST(transaction_date AS BIGINT)) AS TIMESTAMP)\n"
+                "            ) AS _txn_ts,\n"
+                "            COALESCE(\n"
+                "                TRY_STRPTIME(transaction_date, '%Y-%m-%d')::DATE,\n"
+                "                TRY_STRPTIME(transaction_date, '%Y-%m-%d %H:%M:%S')::DATE,\n"
+                "                TRY_STRPTIME(transaction_date, '%d/%m/%Y')::DATE,\n"
+                "                TRY_STRPTIME(transaction_date, '%d/%m/%Y %H:%M:%S')::DATE,\n"
+                "                TRY_CAST(TO_TIMESTAMP(TRY_CAST(transaction_date AS BIGINT)) AS DATE)\n"
+                "            ) AS _parsed_date,\n"
+                "            CASE\n"
+                "                WHEN TRY_STRPTIME(transaction_date, '%Y-%m-%d') IS NOT NULL THEN FALSE\n"
+                "                WHEN TRY_STRPTIME(transaction_date, '%Y-%m-%d %H:%M:%S') IS NOT NULL THEN TRUE\n"
+                "                WHEN TRY_STRPTIME(transaction_date, '%d/%m/%Y') IS NOT NULL THEN TRUE\n"
+                "                WHEN TRY_STRPTIME(transaction_date, '%d/%m/%Y %H:%M:%S') IS NOT NULL THEN TRUE\n"
+                "                WHEN TRY_CAST(transaction_date AS BIGINT) IS NOT NULL THEN TRUE\n"
+                "                ELSE FALSE\n"
+                "            END AS _date_was_non_iso\n"
+                "        FROM chunk_txn\n"
+                "    ),\n"
+                "    deduped AS (\n"
+                "        SELECT p.*\n"
+                "        FROM parsed p\n"
+                "        INNER JOIN dedup_keys d\n"
+                "          ON p.transaction_id = d.transaction_id\n"
+                "         AND p._txn_ts = d.min_ts\n"
+                "    ),\n"
+                "    curr AS (\n"
+                "        SELECT *,\n"
+                "            CASE\n"
+                + currency_cases_sql + "\n"
+                "                ELSE NULL\n"
+                "            END AS _norm_currency\n"
+                "        FROM deduped\n"
+                "    ),\n"
+                "    amounted AS (\n"
+                "        SELECT *, TRY_CAST(amount AS DECIMAL(18,2)) AS _amount_cast\n"
+                "        FROM curr\n"
+                "    ),\n"
+                "    orphaned AS (\n"
+                "        SELECT t.*, (a.account_id IS NULL) AS _is_orphan\n"
+                "        FROM amounted t\n"
+                "        LEFT JOIN silver_acct a USING (account_id)\n"
+                "    )\n"
+                "    SELECT\n"
+                "        transaction_id,\n"
+                "        account_id,\n"
+                "        _parsed_date AS transaction_date,\n"
+                "        transaction_time,\n"
+                "        transaction_type,\n"
+                "        merchant_category,\n"
+                "        merchant_subcategory,\n"
+                "        _amount_cast AS amount,\n"
+                "        COALESCE(_norm_currency, currency) AS currency,\n"
+                "        channel,\n"
+                "        location_province,\n"
+                "        location_city,\n"
+                "        location_coordinates,\n"
+                "        metadata_device_id,\n"
+                "        metadata_session_id,\n"
+                "        metadata_retry_flag,\n"
+                "        ingestion_timestamp,\n"
+                "        CASE\n"
+                "            WHEN currency != 'ZAR' AND _norm_currency IS NOT NULL THEN '" + _DQ_CURRENCY_VARIANT + "'\n"
+                "            WHEN _amount_cast IS NULL THEN '" + _DQ_TYPE_MISMATCH + "'\n"
+                "            WHEN _parsed_date IS NULL THEN '" + _DQ_DATE_FORMAT + "'\n"
+                "            WHEN _date_was_non_iso THEN '" + _DQ_DATE_FORMAT + "'\n"
+                "            WHEN _is_orphan THEN '" + _DQ_ORPHANED_ACCOUNT + "'\n"
+                "            ELSE NULL\n"
+                "        END AS dq_flag,\n"
+                "        _txn_ts AS transaction_timestamp,\n"
+                "        _date_was_non_iso\n"
+                "    FROM orphaned\n"
+                ")\n"
+                "TO '" + out_file + "' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED)"
+            )
+
+            con.execute(sql)
+
+            dq_counts = con.execute(
+                "SELECT "
+                "  SUM(CASE WHEN dq_flag = '" + _DQ_ORPHANED_ACCOUNT + "' THEN 1 ELSE 0 END), "
+                "  SUM(CASE WHEN dq_flag = '" + _DQ_TYPE_MISMATCH + "' THEN 1 ELSE 0 END), "
+                "  SUM(CASE WHEN _date_was_non_iso OR dq_flag = '" + _DQ_DATE_FORMAT + "' THEN 1 ELSE 0 END), "
+                "  SUM(CASE WHEN dq_flag = '" + _DQ_CURRENCY_VARIANT + "' THEN 1 ELSE 0 END) "
+                "FROM read_parquet('" + out_file + "')"
+            ).fetchone()
+
+            orphan_count_total += int(dq_counts[0] or 0)
+            type_mismatch_count_total += int(dq_counts[1] or 0)
+            date_format_count_total += int(dq_counts[2] or 0)
+            currency_variant_count_total += int(dq_counts[3] or 0)
+
+        finally:
+            con.close()
+
+        if (idx + 1) % 6 == 0 or (idx + 1) == len(bronze_files):
+            logger.info("Processed %d / %d Bronze files.", idx + 1, len(bronze_files))
+
+    try:
+        os.remove(dedup_keys_path)
+    except OSError:
+        pass
+
+    logger.info("DuckDB Silver transactions written to: %s", silver_path)
+
+    return {
+        _DQ_DUPLICATE_DEDUPED: duplicate_count_total,
+        _DQ_ORPHANED_ACCOUNT: orphan_count_total,
+        _DQ_TYPE_MISMATCH: type_mismatch_count_total,
+        _DQ_DATE_FORMAT: date_format_count_total,
+        _DQ_CURRENCY_VARIANT: currency_variant_count_total,
+    }
+
+
+def run_silver_transactions_delta_register(
+    spark: SparkSession, cfg: dict[str, Any]
+) -> None:
+    """Register DuckDB-written Parquet files as a Delta table."""
+    silver_path = cfg["output"]["silver_path"] + "/transactions"
+    logger.info("Registering Silver transactions as Delta table.")
+
+    parquet_files = _find_parquet_files(silver_path)
+    parquet_files = [f for f in parquet_files if "_delta_log" not in f]
+
+    df = spark.read.parquet(*parquet_files)
+
+    (
+        df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(silver_path)
+    )
+    logger.info("Silver transactions Delta registration complete.")
 
 
 def _transform_customers(df: DataFrame) -> DataFrame:
-    """Type-cast and deduplicate the customers Bronze table."""
     logger.info("Transforming customers.")
     df = df.withColumn("dob", _parse_date_col(df["dob"]))
-    df = _dedup(df, pk="customer_id", order_col="ingestion_timestamp")
-    logger.info("Customers transformed: %d rows", df.count())
-    return df
+    return _dedup_window(df, pk="customer_id", order_col="ingestion_timestamp")
 
 
-def _transform_accounts(
-    df: DataFrame,
-    silver_customers: DataFrame,
-) -> DataFrame:
-    """Type-cast, deduplicate, and validate referential integrity for accounts."""
+def _transform_accounts(df: DataFrame, silver_customers: DataFrame) -> tuple[DataFrame, int]:
     logger.info("Transforming accounts.")
-
     df = (
         df
-        .withColumn("open_date",         _parse_date_col(df["open_date"]))
+        .withColumn("open_date", _parse_date_col(df["open_date"]))
         .withColumn("last_activity_date", _parse_date_col(df["last_activity_date"]))
-        .withColumn("credit_limit",       F.col("credit_limit").cast(DecimalType(18, 2)))
-        .withColumn("current_balance",    F.col("current_balance").cast(DecimalType(18, 2)))
+        .withColumn("credit_limit", F.col("credit_limit").cast(DecimalType(18, 2)))
+        .withColumn("current_balance", F.col("current_balance").cast(DecimalType(18, 2)))
     )
 
-    # Stage 2: drop rows where account_id is null (NULL_REQUIRED — primary key)
     null_pk_count = df.filter(F.col("account_id").isNull()).count()
     if null_pk_count > 0:
         logger.warning(
             "Dropping %d account rows with null account_id (NULL_REQUIRED).",
             null_pk_count,
         )
+
     df = df.filter(F.col("account_id").isNotNull())
-    df = _dedup(df, pk="account_id", order_col="ingestion_timestamp")
+    df = _dedup_window(df, pk="account_id", order_col="ingestion_timestamp")
 
     orphaned = (
-        df
-        .join(
-            silver_customers.select(F.col("customer_id").alias("_valid_cid")),
+        df.join(
+            F.broadcast(
+                silver_customers.select(F.col("customer_id").alias("_valid_cid"))
+            ),
             df["customer_ref"] == F.col("_valid_cid"),
             "left_anti",
-        )
-        .count()
+        ).count()
     )
     if orphaned > 0:
         logger.warning(
@@ -143,121 +377,26 @@ def _transform_accounts(
         )
 
     logger.info("Accounts transformed: %d rows", df.count())
-    return df
+    return df, null_pk_count
 
 
-def _transform_transactions(
-    df: DataFrame,
-    silver_accounts: DataFrame,
-) -> DataFrame:
-    """Type-cast, deduplicate, and DQ-flag the transactions Bronze table."""
-    logger.info("Transforming transactions.")
-
-    # 1. Deduplication — keep earliest transaction_time per transaction_id
-    df = _dedup(df, pk="transaction_id", order_col="transaction_time")
-
-    # 2. Currency normalisation + CURRENCY_VARIANT flag
-    currency_map_expr = _build_currency_map_expr()
-    df = (
-        df
-        .withColumn("_normalised_currency", currency_map_expr)
-        .withColumn(
-            "dq_flag",
-            F.when(
-                (F.col("currency") != "ZAR") & F.col("_normalised_currency").isNotNull(),
-                F.lit(_DQ_CURRENCY_VARIANT),
-            ).otherwise(F.lit(None).cast("string"))
-        )
-        .withColumn("currency", F.col("_normalised_currency"))
-        .drop("_normalised_currency")
-    )
-
-    # 3. Amount type cast + TYPE_MISMATCH flag
-    df = (
-        df
-        .withColumn("amount", F.col("amount").cast(DecimalType(18, 2)))
-        .withColumn(
-            "dq_flag",
-            F.when(
-                F.col("amount").isNull() & F.col("dq_flag").isNull(),
-                F.lit(_DQ_TYPE_MISMATCH),
-            ).otherwise(F.col("dq_flag"))
-        )
-    )
-
-    # 4. Date parsing + DATE_FORMAT flag
-    df = (
-        df
-        .withColumn("_parsed_date", _parse_date_col(df["transaction_date"]))
-        .withColumn(
-            "dq_flag",
-            F.when(
-                F.col("_parsed_date").isNull() & F.col("dq_flag").isNull(),
-                F.lit(_DQ_DATE_FORMAT),
-            ).otherwise(F.col("dq_flag"))
-        )
-        .withColumn("transaction_date", F.col("_parsed_date"))
-        .drop("_parsed_date")
-    )
-
-    # 5. Combine date + time into transaction_timestamp
-    df = df.withColumn(
-        "transaction_timestamp",
-        F.to_timestamp(
-            F.concat_ws(" ", F.col("transaction_date").cast("string"), F.col("transaction_time")),
-            "yyyy-MM-dd HH:mm:ss",
-        ),
-    )
-
-    # 6. ORPHANED_ACCOUNT flag
-    valid_account_ids = silver_accounts.select(
-        F.col("account_id").alias("_valid_aid")
-    )
-    df = (
-        df
-        .join(valid_account_ids, df["account_id"] == F.col("_valid_aid"), "left")
-        .withColumn(
-            "dq_flag",
-            F.when(
-                F.col("_valid_aid").isNull() & F.col("dq_flag").isNull(),
-                F.lit(_DQ_ORPHANED_ACCOUNT),
-            ).otherwise(F.col("dq_flag"))
-        )
-        .drop("_valid_aid")
-    )
-
-    logger.info("Transactions transformed: %d rows", df.count())
-    return df
-
-
-def _dedup(df: DataFrame, pk: str, order_col: str) -> DataFrame:
-    """Return df deduplicated on pk, keeping the row with the lowest order_col."""
+def _dedup_window(df: DataFrame, pk: str, order_col: str) -> DataFrame:
+    """Window-based dedup — safe for small tables only."""
     w = Window.partitionBy(pk).orderBy(F.col(order_col).asc())
     return (
-        df
-        .withColumn("_row_num", F.row_number().over(w))
+        df.withColumn("_row_num", F.row_number().over(w))
         .filter(F.col("_row_num") == 1)
         .drop("_row_num")
     )
 
 
-def _parse_date_col(col: "Column") -> "Column":  # type: ignore[name-defined]
-    """Try each known date format; return first successful parse or null."""
+def _parse_date_col(col):
     parsed = F.coalesce(*[F.to_date(col, fmt) for fmt in _DATE_FORMATS])
     epoch_parsed = F.to_date(F.from_unixtime(col.cast("long")), "yyyy-MM-dd")
     return F.coalesce(parsed, epoch_parsed)
 
 
-def _build_currency_map_expr() -> "Column":  # type: ignore[name-defined]
-    """Build a CASE expression mapping all known ZAR variants to "ZAR"."""
-    expr = F.when(F.lit(False), F.lit(None))
-    for variant, canonical in _CURRENCY_VARIANTS.items():
-        expr = expr.when(F.col("currency") == variant, F.lit(canonical))
-    return expr.otherwise(F.lit(None).cast("string"))
-
-
-def _write_delta(df: DataFrame, path: str) -> None:
-    """Write df to path as a Delta table, overwriting any prior run."""
+def _write_delta_spark(df: DataFrame, path: str) -> None:
     (
         df.write
         .format("delta")
@@ -265,4 +404,7 @@ def _write_delta(df: DataFrame, path: str) -> None:
         .option("overwriteSchema", "true")
         .save(path)
     )
-    logger.debug("Silver Delta table written to: %s", path)
+
+
+def _find_parquet_files(delta_path: str) -> list[str]:
+    return glob.glob(os.path.join(delta_path, "**", "*.parquet"), recursive=True)
