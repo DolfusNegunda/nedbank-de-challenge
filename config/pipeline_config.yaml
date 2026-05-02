@@ -3,45 +3,34 @@
 #
 # All paths are absolute paths inside the Docker container.
 # The scoring system mounts:
-#   /data/input/   — read-only  (source datasets)
-#   /data/config/  — read-only  (this file, injected at runtime)
-#   /data/output/  — read-write (all pipeline outputs)
-#
-# Loading pattern (Python):
-#   import yaml, os
-#   config_path = os.environ.get("PIPELINE_CONFIG", "/data/config/pipeline_config.yaml")
-#   with open(config_path) as f:
-#       config = yaml.safe_load(f)
+#   /data/input/   — read-only  (batch source datasets)
+#   /data/config/  — read-only  (this file)
+#   /data/output/  — read-write (all outputs)
+#   /data/stream/  — read-only  (Stage 3 stream files)
 # ============================================================
 
-# ── Input paths (read-only; do not write here) ────────────────
-input:
-  accounts_path:     /data/input/accounts.csv
-  transactions_path: /data/input/transactions.jsonl
-  customers_path:    /data/input/customers.csv
+stage: "3"
 
-# ── Output paths (pipeline creates these at runtime) ─────────
+input:
+  accounts_path: /data/input/accounts.csv
+  transactions_path: /data/input/transactions.jsonl
+  customers_path: /data/input/customers.csv
+
 output:
-  bronze_path:    /data/output/bronze
-  silver_path:    /data/output/silver
-  gold_path:      /data/output/gold
+  bronze_path: /data/output/bronze
+  silver_path: /data/output/silver
+  gold_path: /data/output/gold
   dq_report_path: /data/output/dq_report.json
 
-# ── Stage 3 streaming paths (uncomment at Stage 3) ───────────
-# streaming:
-#   stream_input_path:        /data/stream
-#   stream_gold_path:         /data/output/stream_gold
-#   poll_interval_seconds:    10
-#   quiesce_timeout_seconds:  60
+streaming:
+  stream_input_path: /data/stream
+  stream_gold_path: /data/output/stream_gold
+  poll_interval_seconds: 10
+  quiesce_timeout_seconds: 60
 
-# ── Spark settings ────────────────────────────────────────────
-# master must be local[2] — matches the 2-vCPU scoring constraint.
-# Do NOT use local[*] — it will attempt to use all available CPUs.
-# Stage 1 time limit: 15 minutes.  Stage 2/3: 30 minutes.
 spark:
-  master:   local[2]
+  master: local[2]
   app_name: nedbank-de-pipeline
 
-# ── DQ rules reference (required from Stage 2) ───────────────
 dq:
   rules_path: /data/config/dq_rules.yaml

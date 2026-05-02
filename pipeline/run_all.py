@@ -1,7 +1,7 @@
 """
 pipeline/run_all.py
 ───────────────────
-Pipeline entry point — orchestrates Bronze -> Silver -> Gold in sequence.
+Pipeline entry point — orchestrates Bronze -> Silver -> Gold -> Stream.
 
 Runtime strategy
 ----------------
@@ -9,10 +9,13 @@ Phase 1 — Spark ON:
     Bronze ingestion + Silver customers/accounts
 
 Phase 2 — DuckDB:
-    Silver transactions (3M+ rows) processed outside Spark to avoid /tmp spill
+    Silver transactions (Stage 2/3 batch scale) processed outside Spark
 
 Phase 3 — Spark ON:
     Register Silver transactions as Delta + Gold provisioning + dq_report.json
+
+Phase 4 — Spark ON (Stage 3 only):
+    Process stream files into stream_gold tables
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from pipeline.transform import (
     run_silver_transactions_delta_register,
 )
 from pipeline.provision import run_provisioning
+from pipeline.stream_ingest import run_stream_ingestion
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +55,9 @@ def _clean_tmp() -> None:
     """Delete Spark temporary directories from /tmp between phases."""
     tmp = "/tmp"
     removed = 0
+
+    if not os.path.exists(tmp):
+        return
 
     for entry in os.listdir(tmp):
         if entry.startswith(("blockmgr-", "spark-", "hsperfdata_")):
@@ -72,10 +79,14 @@ def main() -> None:
     pipeline_start = time.time()
 
     logger.info("=== Nedbank DE Pipeline starting ===")
-    logger.info("Stage 2 time limit: 30 minutes")
 
     cfg = load_config()
-    cfg["stage"] = "2"
+    stage = str(cfg.get("stage", "2"))
+
+    if stage == "3":
+        logger.info("Stage 3 time limit: 30 minutes")
+    else:
+        logger.info("Stage 2 time limit: 30 minutes")
 
     # ── Phase 1: Spark — Bronze + Silver small tables ─────────────────────────
     logger.info("--- Phase 1: Bronze ingestion + Silver customers/accounts ---")
@@ -121,6 +132,18 @@ def main() -> None:
     finally:
         spark.stop()
         logger.info("SparkSession stopped.")
+
+    _clean_tmp()
+
+    # ── Phase 4: Stage 3 streaming ─────────────────────────────────────────────
+    if stage == "3":
+        logger.info("--- Phase 4: Stream ingestion ---")
+        spark = get_spark(cfg.get("spark", {}))
+        try:
+            run_stream_ingestion(spark, cfg)
+        finally:
+            spark.stop()
+            logger.info("SparkSession stopped after Stage 3 stream ingestion.")
 
     logger.info("=== Pipeline completed successfully ===")
 
