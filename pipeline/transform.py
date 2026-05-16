@@ -262,6 +262,7 @@ def run_silver_transactions_duckdb(cfg: dict[str, Any]) -> dict[str, int]:
                 "        ingestion_timestamp,\n"
                 "        CASE\n"
                 "            WHEN currency != 'ZAR' AND _norm_currency IS NOT NULL THEN '" + _DQ_CURRENCY_VARIANT + "'\n"
+                "            WHEN currency != 'ZAR' THEN '" + _DQ_TYPE_MISMATCH + "'\n"
                 "            WHEN _amount_cast IS NULL THEN '" + _DQ_TYPE_MISMATCH + "'\n"
                 "            WHEN _parsed_date IS NULL THEN '" + _DQ_DATE_FORMAT + "'\n"
                 "            WHEN _date_was_non_iso THEN '" + _DQ_DATE_FORMAT + "'\n"
@@ -281,7 +282,7 @@ def run_silver_transactions_duckdb(cfg: dict[str, Any]) -> dict[str, int]:
                 "SELECT "
                 "  SUM(CASE WHEN dq_flag = '" + _DQ_ORPHANED_ACCOUNT + "' THEN 1 ELSE 0 END), "
                 "  SUM(CASE WHEN dq_flag = '" + _DQ_TYPE_MISMATCH + "' THEN 1 ELSE 0 END), "
-                "  SUM(CASE WHEN _date_was_non_iso OR dq_flag = '" + _DQ_DATE_FORMAT + "' THEN 1 ELSE 0 END), "
+                "  SUM(CASE WHEN dq_flag = '" + _DQ_DATE_FORMAT + "' THEN 1 ELSE 0 END), "
                 "  SUM(CASE WHEN dq_flag = '" + _DQ_CURRENCY_VARIANT + "' THEN 1 ELSE 0 END) "
                 "FROM read_parquet('" + out_file + "')"
             ).fetchone()

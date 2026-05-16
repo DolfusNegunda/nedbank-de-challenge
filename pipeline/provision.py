@@ -373,12 +373,6 @@ def _write_dq_report(
         )
 
     report: dict[str, Any] = {
-        # Local harness compatibility
-        "total_records": total_records,
-        "clean_records": clean_records,
-        "flagged_records": flagged_records,
-        "flag_counts": non_zero_flag_counts,
-        # Stage 2 template fields
         "$schema": "nedbank-de-challenge/dq-report/v1",
         "run_timestamp": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "stage": str(stage),
